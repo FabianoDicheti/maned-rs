@@ -1,0 +1,8 @@
+[package]
+name = "maned-sys"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.65"
+links = "maned_c"
+license = "Apache-2.0 OR MIT"
+description = "Raw FFI declarations for the mnd_* C ABI (scaffold; libmaned_c does not exist yet)"
