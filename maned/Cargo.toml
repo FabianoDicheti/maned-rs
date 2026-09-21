@@ -2,17 +2,37 @@
 name = "maned"
 version = "0.0.0"
 edition = "2021"
-rust-version = "1.65"
+rust-version = "1.77"
 license = "Apache-2.0 OR MIT"
-description = "Call .mnd scripts in-process (scaffold; not functional yet)"
+description = "Call .mnd scripts in-process, through the mnd_* C ABI"
+categories = ["api-bindings", "science"]
+keywords = ["maned", "mnd", "tensor", "inference"]
 
 [features]
 default = ["json"]
+# Kept as a named feature because MANEDRS_PLAN.md §4.4 names it and downstream
+# Cargo.tomls will spell it, but serde/serde_json are unconditional: every
+# public entry point is defined in terms of Serialize or serde_json::Value, so
+# a build without them would have no API left.
 json = []
 tokio = ["dep:tokio"]
+# Mutually exclusive with actually linking: build.rs emits no link directives
+# under it, so `cargo test --all-features` cannot work. Use `--features tokio`.
+docsrs-stub = ["maned-sys/docsrs-stub"]
 
 [dependencies]
-maned-sys = { path = "../maned-sys" }
+maned-sys = { path = "../maned-sys", version = "0.0.0" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt"], optional = true }
+
+[dev-dependencies]
+# The thread-safety table as programs that must NOT compile (§6, gate 7).
+# Cargo.lock pins 1.0.115: 1.0.116+ declares rust-version 1.88 and will not
+# resolve on the 1.87 toolchain this repo is developed against.
+trybuild = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }
+
+[package.metadata.docs.rs]
+features = ["docsrs-stub", "tokio"]
+rustdoc-args = ["--cfg", "docsrs"]

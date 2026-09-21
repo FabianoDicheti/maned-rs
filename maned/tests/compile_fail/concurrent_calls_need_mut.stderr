@@ -1,0 +1,15 @@
+error[E0499]: cannot borrow `script` as mutable more than once at a time
+  --> tests/compile_fail/concurrent_calls_need_mut.rs:15:21
+   |
+13 |     std::thread::scope(|scope| {
+   |                         ----- has type `&'1 Scope<'1, '_>`
+14 |         scope.spawn(|| script.run(&payload));
+   |         ------------------------------------
+   |         |           |  |
+   |         |           |  first borrow occurs due to use of `script` in closure
+   |         |           first mutable borrow occurs here
+   |         argument requires that `script` is borrowed for `'1`
+15 |         scope.spawn(|| script.run(&payload));
+   |                     ^^ ------ second borrow occurs due to use of `script` in closure
+   |                     |
+   |                     second mutable borrow occurs here

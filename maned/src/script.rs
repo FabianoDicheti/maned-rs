@@ -1,50 +1,554 @@
 //! Script / SharedScript / ScriptBuilder — the thread-safety table as types
 //! (MANEDRS_PLAN.md §4.3).
+//!
+//! | | Safe? | Encoded as |
+//! |---|---|---|
+//! | Concurrent calls, one handle, non-routed | yes | [`SharedScript`], `Sync` |
+//! | Concurrent calls, one handle, routed | **no** | `&mut self` on [`Script::run`] |
+//! | Two handles, same routed device | **no** | `Script: !Sync` ⇒ `Arc<Script>: !Send` |
 
 use crate::{Error, Response};
+use maned_sys as sys;
 use serde::Serialize;
+use std::ffi::{CStr, CString};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+use std::ptr;
+use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
-pub struct Script {
-    _handle: *mut core::ffi::c_void,
+// ---------------------------------------------------------------------------
+// The live-handle registry behind maned::shutdown() (hazard 5).
+// ---------------------------------------------------------------------------
+
+/// One script handle, owned jointly by its [`Script`] and the registry.
+///
+/// The pointer lives in an `AtomicPtr` so that "close it" is a swap-to-null:
+/// whoever wins the swap does the `mnd_close` and everybody else sees NULL and
+/// does nothing. That is what makes `shutdown()` and `Drop` racing each other
+/// a non-event rather than a double free.
+struct Handle {
+    ptr: AtomicPtr<sys::mnd_script>,
 }
 
-// SAFETY: sound because the engine keeps no per-thread state that outlives a
-// call — zero `thread_local` in src/ and include/, and parallel_rows joins
-// before returning (src/interp/parallel.cpp:47). Guarded by the grep gate in
-// the maned repo (MANEDRS_PLAN.md §6, gate 8).
+impl Handle {
+    fn close(&self) {
+        let p = self.ptr.swap(ptr::null_mut(), Ordering::AcqRel);
+        if !p.is_null() {
+            // SAFETY: won the swap, so this is the one and only close of this
+            // handle. mnd_close of NULL would be a no-op anyway.
+            unsafe { sys::mnd_close(p) }
+        }
+    }
+
+    fn get(&self) -> Result<*mut sys::mnd_script, Error> {
+        let p = self.ptr.load(Ordering::Acquire);
+        if p.is_null() {
+            return Err(Error::Library(
+                "this script handle is already closed — maned::shutdown() closes \
+                 every live handle, and a Script that outlives it is inert"
+                    .to_string(),
+            ));
+        }
+        Ok(p)
+    }
+}
+
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+/// A Vec, not a HashMap, because `Vec::new` is const and the live-handle count
+/// is single digits in every program that is not leaking.
+static LIVE: Mutex<Vec<(u64, Arc<Handle>)>> = Mutex::new(Vec::new());
+
+fn register(handle: Arc<Handle>) -> u64 {
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    if let Ok(mut live) = LIVE.lock() {
+        live.push((id, handle));
+    }
+    id
+}
+
+fn unregister(id: u64) {
+    if let Ok(mut live) = LIVE.lock() {
+        live.retain(|(other, _)| *other != id);
+    }
+}
+
+/// Close every live handle. See [`crate::shutdown`] for the caveats.
+pub(crate) fn close_all() {
+    let handles: Vec<Arc<Handle>> = match LIVE.lock() {
+        Ok(mut live) => live.drain(..).map(|(_, h)| h).collect(),
+        Err(_) => return,
+    };
+    for h in handles {
+        h.close();
+    }
+}
+
+/// How many handles `shutdown()` would close right now. Test hook, and an
+/// honest answer to "did I leak a Script?".
+pub(crate) fn live_count() -> usize {
+    LIVE.lock().map(|l| l.len()).unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Script
+// ---------------------------------------------------------------------------
+
+/// One loaded `.mnd` script: parsed, linted, inlined, planned and validated
+/// once, then answering requests.
+pub struct Script {
+    id: u64,
+    handle: Arc<Handle>,
+    notes: Vec<String>,
+    path: PathBuf,
+    routed: bool,
+    _not_sync: RoutedDeviceChannelsAreSingleConnection,
+}
+
+/// Keeps [`Script`] `!Sync` (and `!Send`, which the `unsafe impl` below then
+/// restores deliberately). Without it the `Arc<Handle>` field would make the
+/// whole struct `Sync` by inference and §4.3's third row would stop being
+/// enforced.
+///
+/// It is a named type rather than a bare `PhantomData<*const ()>` field for
+/// two reasons: the name appears in the compiler error that rejects
+/// `Arc<Script>`, so the diagnostic says why and not just no; and holding the
+/// raw pointer directly keeps `core::marker`'s own source path out of that
+/// error, which is what lets the `trybuild` expectations be portable.
+// The field is never read, and that is the point: it exists so that auto-trait
+// inference sees a raw pointer inside `Script`. Reading it would be the bug.
+#[allow(dead_code)]
+struct RoutedDeviceChannelsAreSingleConnection(*const ());
+
+impl RoutedDeviceChannelsAreSingleConnection {
+    const MARKER: Self = RoutedDeviceChannelsAreSingleConnection(ptr::null());
+}
+
+// SAFETY: moving a script handle between threads is sound because the engine
+// keeps no per-thread state that outlives a call. Two facts, both true of the
+// engine today and neither written down anywhere in it:
+//   1. `grep -rn 'thread_local\|__thread' src/ include/` returns ZERO matches,
+//      so no call leaves anything behind in the thread that made it;
+//   2. the one place the interpreter spawns threads — `parallel_rows`,
+//      src/interp/parallel.cpp:27-48 — joins every one of them at :47 before
+//      returning, so no worker outlives the call either.
+// Send is only the right to MOVE the handle; it is not the right to use it
+// from two threads at once, which is what `&mut self` on run() and the absence
+// of a `Sync` impl below deny. If someone later adds a thread_local cache or a
+// persistent worker pool to the engine, nothing here breaks loudly: this crate
+// compiles exactly as before and the unsoundness is silent and data-race
+// shaped. The guard therefore lives where the change would be made — a gate in
+// the maned repo asserting that grep stays at zero, naming MANEDRS_PLAN.md
+// §4.3 as the reason (§6, gate 8).
 unsafe impl Send for Script {}
-// Deliberately !Sync: `&mut self` on run() serializes calls with no lock, and
-// Arc<Script> does not compile — a routed handle cannot reach a second thread.
+
+// Deliberately NOT Sync. `&mut self` on run() serializes calls with no lock at
+// all — the borrow checker gives for free what manedpy pays an uncontended
+// mutex for — and `Arc<T>: Send` requires `T: Send + Sync`, so `Arc<Script>`
+// does not compile and a routed handle physically cannot reach a second
+// thread. into_shared() is the only door out, and it checks.
 
 impl Script {
-    pub fn run<T: Serialize>(&mut self, _payload: &T) -> Result<Response, Error> {
-        unimplemented!("{}", crate::BLOCKED)
+    fn adopt(raw: *mut sys::mnd_script, path: PathBuf, notes: Vec<String>) -> Script {
+        let handle = Arc::new(Handle {
+            ptr: AtomicPtr::new(raw),
+        });
+        // SAFETY: `raw` is a live handle from mnd_open; is_routed only reads.
+        let routed = unsafe { sys::mnd_script_is_routed(raw) } != 0;
+        let id = register(Arc::clone(&handle));
+        Script {
+            id,
+            handle,
+            notes,
+            path,
+            routed,
+            _not_sync: RoutedDeviceChannelsAreSingleConnection::MARKER,
+        }
     }
 
+    /// The path this script was loaded from.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Warnings and notes `mnd_open` produced while loading — the JSON array
+    /// the ABI hands back through its fourth out-param, parsed once.
+    pub fn load_notes(&self) -> &[String] {
+        &self.notes
+    }
+
+    /// `POST /run.json` with `payload` serialized as the body, and the status
+    /// map of §4.4 applied: a non-2xx response becomes an `Err`.
+    ///
+    /// `&mut self` is the whole thread-safety story: concurrent calls on one
+    /// handle are only safe for a non-routed script, so they are only
+    /// reachable through [`SharedScript`].
+    pub fn run<T: Serialize + ?Sized>(&mut self, payload: &T) -> Result<Response, Error> {
+        run_on(&self.handle, payload)
+    }
+
+    /// The raw request channel: any method, any target, no status mapping.
+    /// This is `mnd_request` with the strings owned for you — the response
+    /// comes back whatever its status, which is what a conformance harness
+    /// and anyone handling 4xx themselves needs.
+    pub fn request(
+        &mut self,
+        method: &str,
+        target: &str,
+        content_type: Option<&str>,
+        body: &[u8],
+    ) -> Result<Response, Error> {
+        request_on(&self.handle, method, target, content_type, body)
+    }
+
+    /// 1 when any flow routes to a device (`@device` / `host="local"`).
+    ///
+    /// Read once at open, because it cannot change afterwards — the plan is
+    /// built by `mnd_open` and frozen.
     pub fn is_routed(&self) -> bool {
-        unimplemented!("{}", crate::BLOCKED)
+        self.routed
     }
 
-    /// The only door to SharedScript; checks mnd_script_is_routed() as it opens.
-    pub fn into_shared(self) -> Result<SharedScript, Error> {
-        unimplemented!("{}", crate::BLOCKED)
+    /// The only door to [`SharedScript`], and it checks
+    /// `mnd_script_is_routed()` at the moment it opens.
+    ///
+    /// A routed script comes back **inside the error**, so refusing to share
+    /// it does not also destroy it: `mnd_open` is the expensive call, and a
+    /// caller who discovers their script is routed should be able to keep
+    /// using it single-threaded.
+    pub fn into_shared(self) -> Result<SharedScript, RoutedScriptError> {
+        if self.routed {
+            return Err(RoutedScriptError { script: self });
+        }
+        Ok(SharedScript { inner: self })
     }
 }
 
+impl Drop for Script {
+    fn drop(&mut self) {
+        unregister(self.id);
+        self.handle.close();
+    }
+}
+
+impl std::fmt::Debug for Script {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Script")
+            .field("path", &self.path)
+            .field("routed", &self.routed)
+            .field("closed", &self.handle.ptr.load(Ordering::Relaxed).is_null())
+            .finish()
+    }
+}
+
+/// `into_shared()` refused: the script routes to a device, and a device
+/// channel is single-connection. The script itself is in here — take it back
+/// with [`RoutedScriptError::into_script`].
+#[derive(Debug)]
+pub struct RoutedScriptError {
+    script: Script,
+}
+
+impl RoutedScriptError {
+    /// Recover the script the refusal was about.
+    pub fn into_script(self) -> Script {
+        self.script
+    }
+
+    pub fn path(&self) -> &Path {
+        self.script.path()
+    }
+}
+
+impl std::fmt::Display for RoutedScriptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} routes to a device, so it cannot be shared between threads: a \
+             routed script drives single-connection device channels, and two \
+             handles routing to the same device race that device's listener. \
+             Keep the Script and call it from one thread, or put it behind a \
+             Mutex and accept that you have serialized it.",
+            self.script.path().display()
+        )
+    }
+}
+
+impl std::error::Error for RoutedScriptError {}
+
+impl From<RoutedScriptError> for Error {
+    fn from(e: RoutedScriptError) -> Error {
+        Error::Library(e.to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SharedScript
+// ---------------------------------------------------------------------------
+
+/// A script proven non-routed, and therefore callable from many threads at
+/// once with no lock.
 pub struct SharedScript {
-    _inner: Script,
+    inner: Script,
 }
 
-// SAFETY: only constructible when !is_routed(); concurrent handle() calls on a
-// non-routed script are proven identical by tests/serve/test_serve.cpp:920.
+// SAFETY: only constructible through Script::into_shared(), which refuses
+// unless mnd_script_is_routed() == 0. The ABI's rule is exact: "Concurrent
+// mnd_request calls on ONE handle are safe if and only if
+// mnd_script_is_routed(s) == 0", and tests/serve/test_serve.cpp:920
+// (testConcurrentHandleIsIdenticalGap025) proves 8x25 concurrent handle()
+// calls on a non-routed script return identical bytes. `routed` is read once
+// at open and frozen, so the check cannot go stale: mnd_open builds the plan
+// and nothing afterwards can add a device to it. The Send half of this type
+// comes from Script's own unsafe impl Send above, which carries the
+// no-thread_local / parallel_rows-joins argument; this impl adds only the
+// "many threads at once" half, and it is the routed check that earns it.
 unsafe impl Sync for SharedScript {}
 
 impl SharedScript {
-    pub fn run<T: Serialize>(&self, _payload: &T) -> Result<Response, Error> {
-        unimplemented!("{}", crate::BLOCKED)
+    /// `POST /run.json`, from as many threads as you like.
+    pub fn run<T: Serialize + ?Sized>(&self, payload: &T) -> Result<Response, Error> {
+        run_on(&self.inner.handle, payload)
+    }
+
+    /// The raw request channel; see [`Script::request`].
+    pub fn request(
+        &self,
+        method: &str,
+        target: &str,
+        content_type: Option<&str>,
+        body: &[u8],
+    ) -> Result<Response, Error> {
+        request_on(&self.inner.handle, method, target, content_type, body)
+    }
+
+    pub fn path(&self) -> &Path {
+        self.inner.path()
+    }
+
+    pub fn load_notes(&self) -> &[String] {
+        self.inner.load_notes()
+    }
+
+    /// Always `false` — that is why this type exists.
+    pub fn is_routed(&self) -> bool {
+        false
+    }
+
+    /// Back to the exclusive handle.
+    pub fn into_script(self) -> Script {
+        self.inner
     }
 }
 
+impl std::fmt::Debug for SharedScript {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("SharedScript").field(&self.inner).finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The two call paths, shared by both types.
+// ---------------------------------------------------------------------------
+
+fn run_on<T: Serialize + ?Sized>(handle: &Handle, payload: &T) -> Result<Response, Error> {
+    let body = serde_json::to_vec(payload).map_err(Error::Json)?;
+    request_on(handle, "POST", "/run.json", None, &body)?.into_result()
+}
+
+fn request_on(
+    handle: &Handle,
+    method: &str,
+    target: &str,
+    content_type: Option<&str>,
+    body: &[u8],
+) -> Result<Response, Error> {
+    let raw = handle.get()?;
+    let c_method = cstring(method, "method")?;
+    let c_target = cstring(target, "target")?;
+    let c_type = content_type
+        .map(|t| cstring(t, "content_type"))
+        .transpose()?;
+    let type_ptr = c_type.as_ref().map_or(ptr::null(), |c| c.as_ptr());
+    // The ABI takes NULL for an empty body; an empty slice's pointer is
+    // dangling-but-aligned, which is fine in Rust and not worth betting a
+    // foreign library's `if (body)` on.
+    let (body_ptr, body_len) = if body.is_empty() {
+        (ptr::null(), 0)
+    } else {
+        (body.as_ptr() as *const std::ffi::c_char, body.len())
+    };
+
+    // SAFETY: `raw` is live. We hold an Arc<Handle> whose pointer was non-NULL
+    // a moment ago, and the only things that null it are this Script's own Drop
+    // — which cannot run while we hold &self — and maned::shutdown(), which is
+    // documented as an end-of-process call and NOT safe to race against an
+    // in-flight request (see crate::shutdown). Every string is NUL-terminated
+    // and outlives the call; body_len is the length of the slice we passed.
+    let resp = unsafe {
+        sys::mnd_request(
+            raw,
+            c_method.as_ptr(),
+            c_target.as_ptr(),
+            type_ptr,
+            body_ptr,
+            body_len,
+        )
+    };
+    Response::from_raw(resp)
+}
+
+fn cstring(s: &str, what: &str) -> Result<CString, Error> {
+    CString::new(s).map_err(|_| {
+        Error::Library(format!(
+            "{what} contains an interior NUL byte, which a C string cannot carry"
+        ))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// ScriptBuilder
+// ---------------------------------------------------------------------------
+
+/// Flags for `mnd_open`. `maned::load(path)` is `builder(path).open()`.
+///
+/// There is deliberately no `threads()` here: `mnd_set_kernel_threads` is
+/// process-global (`src/interp/parallel.cpp:16`, one `std::atomic<int>`), so
+/// it is a free function and nobody can write `builder.threads(4)` and expect
+/// isolation (hazard 8).
+#[derive(Debug, Clone)]
 pub struct ScriptBuilder {
-    _private: (),
+    path: PathBuf,
+    flags: u32,
+}
+
+impl ScriptBuilder {
+    pub(crate) fn new(path: PathBuf) -> ScriptBuilder {
+        ScriptBuilder { path, flags: 0 }
+    }
+
+    /// `MND_SYNTHESIZE_OUTPUTS` — make a return-only script servable by
+    /// synthesizing outputs for its returned values.
+    pub fn synthesize_outputs(mut self, yes: bool) -> ScriptBuilder {
+        self.set(sys::MND_SYNTHESIZE_OUTPUTS, yes);
+        self
+    }
+
+    /// `MND_NO_VM_FALLBACK` — an unreachable device is a hard error instead of
+    /// falling back to the local VM.
+    pub fn no_vm_fallback(mut self, yes: bool) -> ScriptBuilder {
+        self.set(sys::MND_NO_VM_FALLBACK, yes);
+        self
+    }
+
+    /// The raw `mnd_open` flag word, as it will be passed.
+    pub fn flags(&self) -> u32 {
+        self.flags
+    }
+
+    fn set(&mut self, bit: u32, yes: bool) {
+        if yes {
+            self.flags |= bit;
+        } else {
+            self.flags &= !bit;
+        }
+    }
+
+    /// Parse -> lint -> inline -> plan -> validate, once.
+    pub fn open(self) -> Result<Script, Error> {
+        let c_path = CString::new(self.path.as_os_str().as_bytes()).map_err(|_| Error::Load {
+            path: self.path.clone(),
+            message: "path contains an interior NUL byte".to_string(),
+        })?;
+
+        let mut err: *mut std::ffi::c_char = ptr::null_mut();
+        let mut notes: *mut std::ffi::c_char = ptr::null_mut();
+
+        // SAFETY: c_path is NUL-terminated and outlives the call; err/notes
+        // are valid out-params that we drain with mnd_free_string below,
+        // exactly as ownership rule 1 requires.
+        let raw = unsafe { sys::mnd_open(c_path.as_ptr(), self.flags, &mut err, &mut notes) };
+
+        let load_notes = take_owned_string(notes)
+            .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+            .unwrap_or_default();
+        let message = take_owned_string(err);
+
+        if raw.is_null() {
+            return Err(Error::Load {
+                path: self.path.clone(),
+                message: with_cwd_clause(
+                    message
+                        .unwrap_or_else(|| "mnd_open returned NULL without a message".to_string()),
+                ),
+            });
+        }
+        Ok(Script::adopt(raw, self.path, load_notes))
+    }
+}
+
+/// Hazard 6: `src/serve/server.cpp:1058-1078` hands `in::w = csv("weights.csv")`
+/// to `io::readCsvFile` verbatim, so relative data paths resolve against the
+/// **process** working directory. Rust can `set_current_dir`, unlike the JVM —
+/// and must not: it is process-global and races every other thread, including
+/// the ones `parallel_rows` spawns. So the clarifying clause goes in the load
+/// error instead, where somebody will read it.
+fn with_cwd_clause(message: String) -> String {
+    match std::env::current_dir() {
+        Ok(cwd) => format!(
+            "{}\n(note: relative paths inside a .mnd resolve against the process \
+             working directory, currently {} — prefer absolute paths in the script)",
+            message.trim_end(),
+            cwd.display()
+        ),
+        Err(_) => message,
+    }
+}
+
+/// Take ownership of a `char*` out-param and hand it back to
+/// `mnd_free_string` — ownership rule 1. The caller NEVER calls `free()`.
+fn take_owned_string(p: *mut std::ffi::c_char) -> Option<String> {
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: a heap NUL-terminated string the ABI just gave us, freed once,
+    // here, with the library's own deallocator.
+    let owned = unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned();
+    unsafe { sys::mnd_free_string(p) };
+    Some(owned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builder_flags_map_to_the_header_bits() {
+        let b = ScriptBuilder::new(PathBuf::from("x.mnd"));
+        assert_eq!(b.flags(), 0);
+        assert_eq!(b.clone().synthesize_outputs(true).flags(), 1);
+        assert_eq!(b.clone().no_vm_fallback(true).flags(), 2);
+        assert_eq!(
+            b.clone()
+                .synthesize_outputs(true)
+                .no_vm_fallback(true)
+                .flags(),
+            3
+        );
+        // The setters are idempotent and reversible, so a builder can be
+        // configured from a config file without the caller tracking state.
+        assert_eq!(
+            b.clone()
+                .synthesize_outputs(true)
+                .synthesize_outputs(false)
+                .flags(),
+            0
+        );
+    }
+
+    #[test]
+    fn interior_nul_is_refused_rather_than_truncated() {
+        let e = cstring("POST\0GET", "method").unwrap_err();
+        assert!(e.to_string().contains("interior NUL"), "{e}");
+    }
 }

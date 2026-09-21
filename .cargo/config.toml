@@ -1,0 +1,12 @@
+# Makes a plain `cargo test` work in this checkout.
+#
+# The capi artifact lives beside this repo (../capi-freeze), unpacked from the
+# maned-capi tarball. `relative = true` resolves the value against the
+# directory holding this file, so the pair of checkouts can live anywhere.
+#
+# These are NOT forced: a MANED_LIB_DIR already in the environment wins, which
+# is what you want when building against a different capi build.
+[env]
+MANED_LIB_DIR = { value = "../capi-freeze/lib", relative = true }
+MANED_INCLUDE_DIR = { value = "../capi-freeze/include", relative = true }
+MANED_CONFORMANCE_DIR = { value = "../capi-freeze/conformance", relative = true }

@@ -1,2 +1,10 @@
 target/
-Cargo.lock
+
+# Cargo.lock IS tracked here, unusually for a library workspace. The dev
+# dependency that makes it necessary is trybuild: 1.0.116+ declares
+# rust-version 1.88, so an unlocked resolve on the 1.87 toolchain this repo is
+# developed against fails before a single test runs. The lock pins 1.0.115.
+# Drop this comment and the file together once the toolchain moves.
+
+# trybuild writes rejected/new expectations here.
+wip/

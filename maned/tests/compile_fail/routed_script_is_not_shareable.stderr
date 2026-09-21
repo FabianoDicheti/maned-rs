@@ -1,0 +1,25 @@
+error[E0277]: `*const ()` cannot be shared between threads safely
+  --> tests/compile_fail/routed_script_is_not_shareable.rs:30:28
+   |
+30 |     goes_to_another_thread(shared);
+   |     ---------------------- ^^^^^^ `*const ()` cannot be shared between threads safely
+   |     |
+   |     required by a bound introduced by this call
+   |
+   = help: within `Script`, the trait `Sync` is not implemented for `*const ()`
+note: required because it appears within the type `maned::script::RoutedDeviceChannelsAreSingleConnection`
+  --> src/script.rs
+   |
+   | struct RoutedDeviceChannelsAreSingleConnection(*const ());
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `Script`
+  --> src/script.rs
+   |
+   | pub struct Script {
+   |            ^^^^^^
+   = note: required for `Arc<Script>` to implement `Send`
+note: required by a bound in `goes_to_another_thread`
+  --> tests/compile_fail/routed_script_is_not_shareable.rs:24:30
+   |
+24 | fn goes_to_another_thread<T: Send>(_value: T) {}
+   |                              ^^^^ required by this bound in `goes_to_another_thread`
