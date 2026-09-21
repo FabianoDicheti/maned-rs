@@ -129,10 +129,12 @@ pub fn set_kernel_threads(n: i32) {
 /// - Handles closed here become inert, not dangling: a [`Script`] that
 ///   outlives the call returns an error from `run` instead of touching freed
 ///   memory, and its own `Drop` becomes a no-op.
-/// - It must not race an **in-flight** call. Closing a handle another thread
-///   is currently inside is a use-after-free, and no amount of atomics on this
-///   side can fix that — the fix is to call this when the work has stopped,
-///   which is what "before `process::exit`" means in practice.
+/// - It **drains in-flight calls** before freeing anything: a
+///   [`SharedScript`] call running on another thread holds the handle open,
+///   and this function blocks until that call returns. So it is safe to race,
+///   at the cost of waiting for the work — a seconds-long matmul makes this a
+///   seconds-long call, which is the honest price of not freeing memory under
+///   a live request.
 pub fn shutdown() {
     script::close_all();
 }

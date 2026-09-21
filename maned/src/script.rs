@@ -14,7 +14,7 @@ use std::ffi::{CStr, CString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 // ---------------------------------------------------------------------------
@@ -27,30 +27,66 @@ use std::sync::{Arc, Mutex};
 /// whoever wins the swap does the `mnd_close` and everybody else sees NULL and
 /// does nothing. That is what makes `shutdown()` and `Drop` racing each other
 /// a non-event rather than a double free.
+///
+/// `active` counts in-flight `mnd_request` calls. The swap-to-null alone only
+/// stops NEW calls; a [`SharedScript`] call already inside the engine on
+/// another thread still holds the raw pointer, and an `mnd_close` under it
+/// would be a use-after-free reachable from safe code. So `close()` DRAINS:
+/// swap first (no new entrants), then wait for `active` to hit zero, then
+/// free. The acquire side increments BEFORE re-checking the pointer, so the
+/// two cannot miss each other: either the acquirer sees NULL and backs out,
+/// or the closer sees the incremented count and waits.
 struct Handle {
     ptr: AtomicPtr<sys::mnd_script>,
+    active: AtomicUsize,
+}
+
+/// Proof of an in-flight call: holds the raw pointer and keeps `active`
+/// non-zero until dropped, which is what `Handle::close` waits on.
+struct CallGuard<'a> {
+    handle: &'a Handle,
+    raw: *mut sys::mnd_script,
+}
+
+impl Drop for CallGuard<'_> {
+    fn drop(&mut self) {
+        self.handle.active.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Handle {
     fn close(&self) {
-        let p = self.ptr.swap(ptr::null_mut(), Ordering::AcqRel);
+        let p = self.ptr.swap(ptr::null_mut(), Ordering::SeqCst);
         if !p.is_null() {
-            // SAFETY: won the swap, so this is the one and only close of this
-            // handle. mnd_close of NULL would be a no-op anyway.
+            // Won the swap: no new call can enter. Drain the ones already in.
+            // A call can legitimately run for seconds (a large matmul), so
+            // this is a sleep loop, not a spin — and blocking here is the
+            // point: shutdown-before-exit means "when the work has stopped",
+            // and this is what makes that true rather than hoped.
+            while self.active.load(Ordering::SeqCst) != 0 {
+                std::thread::sleep(std::time::Duration::from_micros(500));
+            }
+            // SAFETY: the one and only close of this handle (the swap was
+            // won), and no call is inside it (the drain completed).
             unsafe { sys::mnd_close(p) }
         }
     }
 
-    fn get(&self) -> Result<*mut sys::mnd_script, Error> {
-        let p = self.ptr.load(Ordering::Acquire);
+    fn acquire(&self) -> Result<CallGuard<'_>, Error> {
+        // Increment FIRST, then re-check the pointer: if close() swapped
+        // before our load we back out; if it swaps after, it sees our
+        // increment and drains. Either way no call runs on freed memory.
+        self.active.fetch_add(1, Ordering::SeqCst);
+        let p = self.ptr.load(Ordering::SeqCst);
         if p.is_null() {
+            self.active.fetch_sub(1, Ordering::SeqCst);
             return Err(Error::Library(
                 "this script handle is already closed — maned::shutdown() closes \
                  every live handle, and a Script that outlives it is inert"
                     .to_string(),
             ));
         }
-        Ok(p)
+        Ok(CallGuard { handle: self, raw: p })
     }
 }
 
@@ -152,6 +188,7 @@ impl Script {
     fn adopt(raw: *mut sys::mnd_script, path: PathBuf, notes: Vec<String>) -> Script {
         let handle = Arc::new(Handle {
             ptr: AtomicPtr::new(raw),
+            active: AtomicUsize::new(0),
         });
         // SAFETY: `raw` is a live handle from mnd_open; is_routed only reads.
         let routed = unsafe { sys::mnd_script_is_routed(raw) } != 0;
@@ -363,7 +400,7 @@ fn request_on(
     content_type: Option<&str>,
     body: &[u8],
 ) -> Result<Response, Error> {
-    let raw = handle.get()?;
+    let guard = handle.acquire()?;
     let c_method = cstring(method, "method")?;
     let c_target = cstring(target, "target")?;
     let c_type = content_type
@@ -379,15 +416,14 @@ fn request_on(
         (body.as_ptr() as *const std::ffi::c_char, body.len())
     };
 
-    // SAFETY: `raw` is live. We hold an Arc<Handle> whose pointer was non-NULL
-    // a moment ago, and the only things that null it are this Script's own Drop
-    // — which cannot run while we hold &self — and maned::shutdown(), which is
-    // documented as an end-of-process call and NOT safe to race against an
-    // in-flight request (see crate::shutdown). Every string is NUL-terminated
-    // and outlives the call; body_len is the length of the slice we passed.
+    // SAFETY: `guard` proves the handle was live when we entered AND keeps
+    // `Handle::close` (Drop or maned::shutdown, either thread) parked in its
+    // drain loop until the guard drops - so the pointer cannot be freed under
+    // this call. Every string is NUL-terminated and outlives the call;
+    // body_len is the length of the slice we passed.
     let resp = unsafe {
         sys::mnd_request(
-            raw,
+            guard.raw,
             c_method.as_ptr(),
             c_target.as_ptr(),
             type_ptr,
@@ -395,6 +431,7 @@ fn request_on(
             body_len,
         )
     };
+    drop(guard);
     Response::from_raw(resp)
 }
 
@@ -550,5 +587,44 @@ mod tests {
     fn interior_nul_is_refused_rather_than_truncated() {
         let e = cstring("POST\0GET", "method").unwrap_err();
         assert!(e.to_string().contains("interior NUL"), "{e}");
+    }
+
+    // The soundness contract behind `unsafe impl Sync for SharedScript`:
+    // close() must DRAIN in-flight calls, not free under them. Deterministic:
+    // the guard is held by hand, so the closer is provably parked in its
+    // drain loop until release - no timing-dependent request needed.
+    #[test]
+    fn close_drains_in_flight_calls_before_freeing() {
+        let dir = std::env::temp_dir().join(format!(
+            "maned_rs_drain_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("drain.mnd");
+        std::fs::write(
+            &path,
+            "mnd::quantmax=30000;\nmnd::quantmin=-30000;\nmnd::quantres=0;\n\
+             calc::lambda_flow f(x) {\n    x relu y =\n} return y;\n",
+        )
+        .unwrap();
+        let script = crate::builder(&path).synthesize_outputs(true).open().unwrap();
+        let shared = script.into_shared().unwrap();
+
+        let guard = shared.inner.handle.acquire().expect("live handle");
+        let closer = Arc::clone(&shared.inner.handle);
+        let t = std::thread::spawn(move || closer.close());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !t.is_finished(),
+            "close() returned while a call guard was outstanding"
+        );
+        drop(guard); // the in-flight call ends...
+        t.join().unwrap(); // ...and only now does close() complete.
+
+        // The handle is inert afterwards, and a late acquire backs out
+        // cleanly (its increment must not wedge a future closer).
+        assert!(shared.inner.handle.acquire().is_err());
+        assert_eq!(shared.inner.handle.active.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
