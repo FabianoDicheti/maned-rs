@@ -7,15 +7,16 @@
 //! | Concurrent calls, one handle, routed | **no** | `&mut self` on [`Script::run`] |
 //! | Two handles, same routed device | **no** | `Script: !Sync` ⇒ `Arc<Script>: !Send` |
 
-use crate::{Error, Response};
+use crate::{multipart, Error, Response};
 use maned_sys as sys;
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::ffi::{CStr, CString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 // ---------------------------------------------------------------------------
 // The live-handle registry behind maned::shutdown() (hazard 5).
@@ -138,7 +139,24 @@ pub struct Script {
     notes: Vec<String>,
     path: PathBuf,
     routed: bool,
+    /// The `GET /health` document, minus `requests_served`, fetched at most
+    /// once. The contract it describes is frozen by `mnd_open` — the plan is
+    /// built there and never rebuilt — so re-asking would buy nothing but a
+    /// round trip per `run_files` call.
+    health: OnceLock<serde_json::Value>,
     _not_sync: RoutedDeviceChannelsAreSingleConnection,
+}
+
+/// One `in::` or `out::` entry of the script's contract, from `GET /health`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IoSpec {
+    pub name: String,
+    /// `"json"`, `"csv"`, `"image"`, `"parquet"`, `"text"` — the `in::`/`out::`
+    /// source or sink keyword. `""` when the engine did not name one.
+    pub format: String,
+    /// Whether an `in::` has a literal default in the script, so a payload may
+    /// omit it. `None` on an `out::`, which cannot have one.
+    pub default: Option<bool>,
 }
 
 /// Keeps [`Script`] `!Sync` (and `!Send`, which the `unsafe impl` below then
@@ -199,6 +217,7 @@ impl Script {
             notes,
             path,
             routed,
+            health: OnceLock::new(),
             _not_sync: RoutedDeviceChannelsAreSingleConnection::MARKER,
         }
     }
@@ -236,6 +255,86 @@ impl Script {
         body: &[u8],
     ) -> Result<Response, Error> {
         request_on(&self.handle, method, target, content_type, body)
+    }
+
+    /// `POST /frame` — the `frame::` tables as a JSON document, status-mapped
+    /// like [`run`](Script::run).
+    ///
+    /// The frame document **is** the body here; unlike `/run.json` the tables
+    /// are not nested under a `frames` key.
+    pub fn frame<T: Serialize + ?Sized>(&mut self, payload: &T) -> Result<Response, Error> {
+        frame_on(&self.handle, payload)
+    }
+
+    /// `POST /frame.csv` — the same tables as CSV text, bytes as written.
+    ///
+    /// Returned undecoded: a `text` column carries raw bytes `0..255` and is
+    /// never promised to be UTF-8.
+    pub fn frame_csv<T: Serialize + ?Sized>(&mut self, payload: &T) -> Result<Vec<u8>, Error> {
+        frame_csv_on(&self.handle, payload)
+    }
+
+    /// `POST /run` as multipart — **the file route**: raw bytes in, raw bytes
+    /// out, one part per declared `out::`.
+    ///
+    /// This is the only way to get the engine's actual file output. `/run.json`
+    /// renders an `out::` image as a nested integer array and a csv as a JSON
+    /// tensor; here a PNG comes back as a PNG.
+    ///
+    /// Each entry of `files` is an `in::` name and the raw bytes for it — CSV
+    /// text, a PNG, a parquet file — in whatever format that input declares.
+    ///
+    /// ```no_run
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut script = maned::load("score.mnd")?;
+    /// let parts = script.run_files(&[("h0", std::fs::read("rows.csv")?)])?;
+    /// std::fs::write("out.png", &parts["heatmap"])?;
+    /// # Ok(()) }
+    /// ```
+    pub fn run_files<K: AsRef<str>, V: AsRef<[u8]>>(
+        &mut self,
+        files: &[(K, V)],
+    ) -> Result<BTreeMap<String, Vec<u8>>, Error> {
+        run_files_on(&self.handle, &self.health, files)
+    }
+
+    /// `GET /health` — the script's contract, fetched once and cached.
+    ///
+    /// `requests_served` is removed: it counts calls on this handle only, so
+    /// it looks like a server metric and is not one.
+    pub fn health(&self) -> Result<&serde_json::Value, Error> {
+        health_on(&self.handle, &self.health)
+    }
+
+    /// The `in::` contract — what a payload may or must carry.
+    pub fn inputs(&self) -> Result<Vec<IoSpec>, Error> {
+        Ok(io_specs(self.health()?, "inputs"))
+    }
+
+    /// The response schema — the `out::` names [`run_files`](Script::run_files)
+    /// returns parts for.
+    ///
+    /// Under `synthesize_outputs` this lists the *synthesized* names, because
+    /// synthesis happens in the engine's own `script.outputs`, so this and
+    /// what `run` returns cannot disagree.
+    pub fn outputs(&self) -> Result<Vec<IoSpec>, Error> {
+        Ok(io_specs(self.health()?, "outputs"))
+    }
+
+    /// The routes this script actually answers, e.g. `"POST /frame.csv"` only
+    /// when it declares a `frame::`.
+    pub fn routes(&self) -> Result<Vec<String>, Error> {
+        Ok(self
+            .health()?
+            .get("routes")
+            .and_then(|r| r.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|i| i.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     /// 1 when any flow routes to a device (`@device` / `host="local"`).
@@ -359,6 +458,45 @@ impl SharedScript {
         request_on(&self.inner.handle, method, target, content_type, body)
     }
 
+    /// `POST /frame`; see [`Script::frame`].
+    pub fn frame<T: Serialize + ?Sized>(&self, payload: &T) -> Result<Response, Error> {
+        frame_on(&self.inner.handle, payload)
+    }
+
+    /// `POST /frame.csv`; see [`Script::frame_csv`].
+    pub fn frame_csv<T: Serialize + ?Sized>(&self, payload: &T) -> Result<Vec<u8>, Error> {
+        frame_csv_on(&self.inner.handle, payload)
+    }
+
+    /// `POST /run` as multipart, from as many threads as you like; see
+    /// [`Script::run_files`].
+    pub fn run_files<K: AsRef<str>, V: AsRef<[u8]>>(
+        &self,
+        files: &[(K, V)],
+    ) -> Result<BTreeMap<String, Vec<u8>>, Error> {
+        run_files_on(&self.inner.handle, &self.inner.health, files)
+    }
+
+    /// `GET /health`, fetched once and cached; see [`Script::health`].
+    pub fn health(&self) -> Result<&serde_json::Value, Error> {
+        self.inner.health()
+    }
+
+    /// See [`Script::inputs`].
+    pub fn inputs(&self) -> Result<Vec<IoSpec>, Error> {
+        self.inner.inputs()
+    }
+
+    /// See [`Script::outputs`].
+    pub fn outputs(&self) -> Result<Vec<IoSpec>, Error> {
+        self.inner.outputs()
+    }
+
+    /// See [`Script::routes`].
+    pub fn routes(&self) -> Result<Vec<String>, Error> {
+        self.inner.routes()
+    }
+
     pub fn path(&self) -> &Path {
         self.inner.path()
     }
@@ -433,6 +571,90 @@ fn request_on(
     };
     drop(guard);
     Response::from_raw(resp)
+}
+
+fn frame_on<T: Serialize + ?Sized>(handle: &Handle, payload: &T) -> Result<Response, Error> {
+    let body = serde_json::to_vec(payload).map_err(Error::Json)?;
+    request_on(handle, "POST", "/frame", None, &body)?.into_result()
+}
+
+fn frame_csv_on<T: Serialize + ?Sized>(handle: &Handle, payload: &T) -> Result<Vec<u8>, Error> {
+    let body = serde_json::to_vec(payload).map_err(Error::Json)?;
+    let response = request_on(handle, "POST", "/frame.csv", None, &body)?.into_result()?;
+    Ok(response.body().to_vec())
+}
+
+fn run_files_on<K: AsRef<str>, V: AsRef<[u8]>>(
+    handle: &Handle,
+    cache: &OnceLock<serde_json::Value>,
+    files: &[(K, V)],
+) -> Result<BTreeMap<String, Vec<u8>>, Error> {
+    let boundary = multipart::boundary_for(files);
+    let body = multipart::encode(&boundary, files);
+    let content_type = format!("multipart/form-data; boundary={boundary}");
+    let response = request_on(handle, "POST", "/run", Some(&content_type), &body)?.into_result()?;
+
+    let answered = response.content_type();
+    if answered.to_ascii_lowercase().starts_with("multipart/") {
+        return multipart::decode(answered, response.body());
+    }
+    // A single-output script answers with the bare file and no part name at
+    // all, so the one declared out:: name is the key. Anything else would
+    // make the return type depend on how many outputs the script happens to
+    // have, which is exactly what a caller cannot branch on in advance.
+    let names = io_specs(health_on(handle, cache)?, "outputs");
+    let key = match names.as_slice() {
+        [only] => only.name.clone(),
+        _ => "body".to_string(),
+    };
+    let mut parts = BTreeMap::new();
+    parts.insert(key, response.body().to_vec());
+    Ok(parts)
+}
+
+fn health_on<'a>(
+    handle: &Handle,
+    cache: &'a OnceLock<serde_json::Value>,
+) -> Result<&'a serde_json::Value, Error> {
+    if let Some(document) = cache.get() {
+        return Ok(document);
+    }
+    let response = request_on(handle, "GET", "/health", None, &[])?.into_result()?;
+    let mut document: serde_json::Value =
+        serde_json::from_slice(response.body()).map_err(Error::Json)?;
+    if let Some(object) = document.as_object_mut() {
+        object.remove("requests_served");
+    }
+    // Two threads racing here both fetch and one set() wins; the loser drops
+    // an identical document. A Mutex would serialize a call that is idempotent
+    // and cheap, and get_or_try_init is not stable on this MSRV.
+    let _ = cache.set(document);
+    Ok(cache
+        .get()
+        .expect("OnceLock was just set and is never cleared"))
+}
+
+fn io_specs(document: &serde_json::Value, key: &str) -> Vec<IoSpec> {
+    document
+        .get(key)
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    Some(IoSpec {
+                        name: item.get("name")?.as_str()?.to_string(),
+                        format: item
+                            .get("format")
+                            .and_then(|f| f.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        default: item.get("default").and_then(|d| d.as_bool()),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn cstring(s: &str, what: &str) -> Result<CString, Error> {

@@ -8,6 +8,7 @@
 
 use crate::{Error, Response, SharedScript};
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 impl SharedScript {
@@ -44,6 +45,44 @@ impl SharedScript {
         // Response is Send (see response.rs) — that impl is what lets the
         // result come back out of the blocking pool at all.
         match tokio::task::spawn_blocking(move || self.run(&payload)).await {
+            Ok(result) => result,
+            Err(join) => Err(Error::Library(format!(
+                "the blocking task running mnd_request did not complete: {join}"
+            ))),
+        }
+    }
+
+    /// `POST /run` as multipart on a blocking-pool thread — the async half of
+    /// [`SharedScript::run_files`].
+    ///
+    /// The files are owned `(String, Vec<u8>)` pairs for the same reason the
+    /// payload of [`run_async`](SharedScript::run_async) is owned: the closure
+    /// must be `'static`. That is also the right shape here, since the bytes
+    /// usually come straight out of a `tokio::fs::read`.
+    ///
+    /// Every caveat of `run_async` applies unchanged — above all that dropping
+    /// this future does not stop the work.
+    #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
+    pub async fn run_files_async(
+        self: Arc<Self>,
+        files: Vec<(String, Vec<u8>)>,
+    ) -> Result<BTreeMap<String, Vec<u8>>, Error> {
+        match tokio::task::spawn_blocking(move || self.run_files(&files)).await {
+            Ok(result) => result,
+            Err(join) => Err(Error::Library(format!(
+                "the blocking task running mnd_request did not complete: {join}"
+            ))),
+        }
+    }
+
+    /// `POST /frame` on a blocking-pool thread; see
+    /// [`run_async`](SharedScript::run_async) for the caveats.
+    #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
+    pub async fn frame_async<T: Serialize + Send + 'static>(
+        self: Arc<Self>,
+        payload: T,
+    ) -> Result<Response, Error> {
+        match tokio::task::spawn_blocking(move || self.frame(&payload)).await {
             Ok(result) => result,
             Err(join) => Err(Error::Library(format!(
                 "the blocking task running mnd_request did not complete: {join}"

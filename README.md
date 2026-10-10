@@ -78,6 +78,28 @@ It exists so docs.rs — sandboxed, no network, no library — can render the AP
 `build.rs` short-circuits to no link directives. `cargo test --all-features`
 therefore does **not** work; use `--features tokio`.
 
+## The file routes
+
+`run()` goes to `/run.json`, which renders an `out::` image as a nested integer
+array and a csv as a JSON tensor. For the engine's actual file bytes there is
+the multipart route, and it takes file bytes on the way in too — a `csv()` /
+`image()` / `parquet()` `in::` never has to be decoded into JSON first.
+
+| Call | Route | Returns |
+|---|---|---|
+| `script.run_files(&[("h0", bytes)])` | `POST /run` multipart | `BTreeMap<String, Vec<u8>>`, one entry per `out::` |
+| `script.frame(&payload)` | `POST /frame` | `Response` — the frame document *is* the body |
+| `script.frame_csv(&payload)` | `POST /frame.csv` | `Vec<u8>`, undecoded |
+| `script.inputs()` / `.outputs()` / `.routes()` / `.health()` | `GET /health` | the contract, fetched once and cached |
+
+`maned::multipart::{encode, decode, boundary_for}` are public for anyone driving
+`request()` by hand. The encoding is byte-identical to manedpy's and
+maned-kotlin's — `tests/io.rs` asserts it against a frozen body, so a drift is
+red rather than merely different.
+
+`SharedScript` has the same four calls plus `run_files_async` / `frame_async`
+under the `tokio` feature.
+
 ## Non-goals (v1)
 
 - **Windows** — the serve and net layers are POSIX throughout. `build.rs`

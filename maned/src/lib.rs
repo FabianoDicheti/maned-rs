@@ -39,6 +39,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 mod error;
+pub mod multipart;
 mod response;
 mod script;
 
@@ -47,7 +48,7 @@ mod async_;
 
 pub use error::Error;
 pub use response::{Response, Tensor};
-pub use script::{RoutedScriptError, Script, ScriptBuilder, SharedScript};
+pub use script::{IoSpec, RoutedScriptError, Script, ScriptBuilder, SharedScript};
 
 use std::ffi::CStr;
 use std::path::{Path, PathBuf};
