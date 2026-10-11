@@ -1,3 +1,5 @@
+![the maned mark, geared](https://raw.githubusercontent.com/FabianoDicheti/maned-rs/master/docs/img/logo.png)
+
 # maned-rs
 
 Call `.mnd` scripts from Rust, in-process, via link-time FFI against `libmaned_c`.
@@ -143,6 +145,8 @@ red rather than merely different.
 
 `SharedScript` has the same four calls plus `run_files_async` / `frame_async`
 under the `tokio` feature.
+
+![a maned wolf with a crab](https://raw.githubusercontent.com/FabianoDicheti/maned-rs/master/docs/img/wolf.png)
 
 ## Non-goals (v1)
 
