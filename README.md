@@ -54,7 +54,9 @@ y = shape [2, 2], data [2, 4, 0, 2]
 [Downstream binaries need the rpath too](#downstream-binaries-need-the-rpath-too).)
 
 The same program lives in this repo as `maned/examples/scoring.rs` —
-`cargo run --example scoring`.
+`cargo run --example scoring`. Three deep dives sit beside it:
+`--example files` (file routes), `--example decimals_tokio --features tokio`
+(exact decimals + async), `--example routed` (the local Bark VM).
 
 ## Read this first: linking and licensing
 
