@@ -14,6 +14,48 @@ HTTP framing. A response here is byte-identical to what the REST API returns
 for the same script and body, and the test suite walks the shared conformance
 corpus to prove it.
 
+## Quickstart
+
+Step by step, from nothing to a running program:
+
+1. Install the engine library — download `maned-capi-0.4.0-<target>.tar.gz`
+   from https://github.com/FabianoDicheti/maned/releases, unpack it, and
+   either copy `lib/` + `include/` into a standard prefix (`/usr/local`)
+   or remember its path for step 4.
+
+2. Create a project and add the crate (published on crates.io):
+
+```sh
+cargo new scoring && cd scoring
+cargo add maned serde_json
+```
+
+3. Save the script as `scoring.mnd` and put this in `src/main.rs`:
+
+```rust
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut script = maned::load("scoring.mnd")?;
+    let result = script.run(&serde_json::json!({"x": [[2, 0], [0, 2]]}))?;
+    let y = result.tensor("y")?;
+    println!("y = shape {:?}, data {:?}", y.shape, y.data);
+    Ok(())
+}
+```
+
+4. Build and run. With the tarball in a standard prefix, plain `cargo run`
+   works; with a custom location, name it:
+
+```sh
+$ MANED_LIB_DIR=/path/to/capi/lib MANED_INCLUDE_DIR=/path/to/capi/include cargo run
+y = shape [2, 2], data [2, 4, 0, 2]
+```
+
+(If the binary dies at startup with `Library not loaded: @rpath/...`, read
+[Downstream binaries need the rpath too](#downstream-binaries-need-the-rpath-too).)
+
+The same program lives in this repo as `maned/examples/scoring.rs` —
+`cargo run --example scoring`.
+
 ## Read this first: linking and licensing
 
 - **Dynamic-link only.** Static linking (`libmaned_c.a`) is not licensed — the maned
