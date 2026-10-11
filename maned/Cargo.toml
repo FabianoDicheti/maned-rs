@@ -1,6 +1,6 @@
 [package]
 name = "maned"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 rust-version = "1.77"
 license = "Apache-2.0 OR MIT"
@@ -25,7 +25,7 @@ tokio = ["dep:tokio"]
 docsrs-stub = ["maned-sys/docsrs-stub"]
 
 [dependencies]
-maned-sys = { path = "../maned-sys", version = "0.4.0" }
+maned-sys = { path = "../maned-sys", version = "0.4.1" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt"], optional = true }

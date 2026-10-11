@@ -1,6 +1,6 @@
 [package]
 name = "maned-sys"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 rust-version = "1.77"
 links = "maned_c"
