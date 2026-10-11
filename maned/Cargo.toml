@@ -40,3 +40,7 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] 
 [package.metadata.docs.rs]
 features = ["docsrs-stub", "tokio"]
 rustdoc-args = ["--cfg", "docsrs"]
+
+[[example]]
+name = "decimals_tokio"
+required-features = ["tokio"]
